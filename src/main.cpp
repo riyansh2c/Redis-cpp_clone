@@ -3,6 +3,7 @@
 #include <vector>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <chrono>
 #include <thread>
 #include <mutex>
@@ -12,20 +13,43 @@
 #include <cstring>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 #include <unistd.h>
 
+// Replication & Server Configuration
+std::string server_role = "master";
+int server_port = 6379;
+std::string master_host = "";
+int master_port = 0;
+
+// Client Transaction and Watch State
+struct ClientState {
+    int client_fd;
+    bool in_multi = false;
+    bool transaction_dirty = false;
+    std::vector<std::vector<std::string>> queued_commands;
+    std::unordered_set<std::string> watched_keys;
+};
+
+// Stream Storage Data Structures
 struct StreamEntry {
     std::string id;
     std::vector<std::pair<std::string, std::string>> kv_pairs;
 };
 
+// Global Memory Stores and Registries
 std::unordered_map<std::string, std::string> kv_store;
 std::unordered_map<std::string, std::chrono::time_point<std::chrono::steady_clock>> expiry_store;
 std::unordered_map<std::string, std::vector<StreamEntry>> stream_store;
 
+inline std::unordered_map<std::string, std::unordered_set<int>> watched_keys_registry;
+inline std::unordered_map<int, ClientState> clients_registry;
+
 std::mutex db_mutex;
 std::condition_variable stream_cv;
 
+// Helper: Parse stream IDs (e.g., "1000-1" or "*")
 void parse_stream_id(const std::string& id_str, uint64_t& ms, uint64_t& seq, bool& auto_seq) {
     auto_seq = false;
     size_t dash = id_str.find('-');
@@ -44,7 +68,53 @@ void parse_stream_id(const std::string& id_str, uint64_t& ms, uint64_t& seq, boo
     }
 }
 
-// Helper function to execute commands and format RESP responses
+// Invalidate watched keys across all watching clients
+void touchKey(const std::string& key) {
+    auto it = watched_keys_registry.find(key);
+    if (it != watched_keys_registry.end()) {
+        for (int fd : it->second) {
+            if (clients_registry.count(fd)) {
+                clients_registry[fd].transaction_dirty = true;
+            }
+        }
+    }
+}
+
+// Clean up watched key subscriptions for a given client
+void cleanupClientWatches(ClientState& client) {
+    for (const std::string& key : client.watched_keys) {
+        auto it = watched_keys_registry.find(key);
+        if (it != watched_keys_registry.end()) {
+            it->second.erase(client.client_fd);
+            if (it->second.empty()) {
+                watched_keys_registry.erase(it);
+            }
+        }
+    }
+    client.watched_keys.clear();
+}
+
+std::string handleWatch(ClientState& client, const std::vector<std::string>& args) {
+    if (args.size() < 2) {
+        return "-ERR wrong number of arguments for 'watch' command\r\n";
+    }
+    if (client.in_multi) {
+        return "-ERR WATCH inside MULTI is not allowed\r\n";
+    }
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& key = args[i];
+        client.watched_keys.insert(key);
+        watched_keys_registry[key].insert(client.client_fd);
+    }
+    return "+OK\r\n";
+}
+
+std::string handleUnwatch(ClientState& client) {
+    cleanupClientWatches(client);
+    return "+OK\r\n";
+}
+
+// Primary execution router for standard commands
 std::string execute_command(const std::vector<std::string>& tokens) {
     if (tokens.empty()) return "";
 
@@ -57,6 +127,25 @@ std::string execute_command(const std::vector<std::string>& tokens) {
     else if (command == "ECHO" && tokens.size() >= 2) {
         return "$" + std::to_string(tokens[1].length()) + "\r\n" + tokens[1] + "\r\n";
     }
+    else if (command == "INFO") {
+        std::string section = (tokens.size() >= 2) ? tokens[1] : "default";
+        std::transform(section.begin(), section.end(), section.begin(), ::toupper);
+
+        std::string info_body = "";
+        info_body += "# Replication\r\n";
+        info_body += "role:" + server_role + "\r\n";
+        info_body += "connected_replicas:0\r\n";
+        info_body += "master_replid:8371b4ed115d9771a04d4a1636540b76fc1a1425\r\n";
+        info_body += "master_repl_offset:0\r\n";
+
+        return "$" + std::to_string(info_body.length()) + "\r\n" + info_body + "\r\n";
+    }
+    else if (command == "REPLCONF") {
+        return "+OK\r\n";
+    }
+    else if (command == "PSYNC") {
+        return "+FULLRESYNC 8371b4ed115d9771a04d4a1636540b76fc1a1425 0\r\n";
+    }
     else if (command == "SET" && tokens.size() >= 3) {
         std::lock_guard<std::mutex> lock(db_mutex);
         kv_store[tokens[1]] = tokens[2];
@@ -68,6 +157,7 @@ std::string execute_command(const std::vector<std::string>& tokens) {
                 expiry_store[tokens[1]] = std::chrono::steady_clock::now() + std::chrono::milliseconds(px);
             }
         }
+        touchKey(tokens[1]);
         return "+OK\r\n";
     }
     else if (command == "GET" && tokens.size() >= 2) {
@@ -99,13 +189,13 @@ std::string execute_command(const std::vector<std::string>& tokens) {
 
         current_val++;
         kv_store[key] = std::to_string(current_val);
+        touchKey(key);
         return ":" + std::to_string(current_val) + "\r\n";
     }
     else if (command == "TYPE" && tokens.size() >= 2) {
         std::lock_guard<std::mutex> lock(db_mutex);
         std::string key = tokens[1];
 
-        // Clean up expired key if necessary
         if (expiry_store.count(key) && std::chrono::steady_clock::now() > expiry_store[key]) {
             kv_store.erase(key);
             expiry_store.erase(key);
@@ -179,6 +269,7 @@ std::string execute_command(const std::vector<std::string>& tokens) {
             }
 
             stream.push_back(entry);
+            touchKey(key);
         }
 
         stream_cv.notify_all();
@@ -244,119 +335,55 @@ std::string execute_command(const std::vector<std::string>& tokens) {
 
         return "*" + std::to_string(count) + "\r\n" + response;
     }
-    else if (command == "XREAD" && tokens.size() >= 4) {
-        int block_ms = -1;
-        size_t streams_idx = 0;
-
-        for (size_t i = 1; i < tokens.size(); ++i) {
-            std::string arg = tokens[i];
-            std::transform(arg.begin(), arg.end(), arg.begin(), ::toupper);
-            if (arg == "BLOCK" && i + 1 < tokens.size()) {
-                block_ms = std::stoi(tokens[i + 1]);
-            } else if (arg == "STREAMS") {
-                streams_idx = i;
-                break;
-            }
-        }
-
-        if (streams_idx != 0 && streams_idx < tokens.size() - 1) {
-            size_t num_args = tokens.size() - (streams_idx + 1);
-            size_t num_streams = num_args / 2;
-
-            std::vector<std::string> keys;
-            std::vector<std::string> start_ids;
-
-            for (size_t i = 0; i < num_streams; ++i) {
-                keys.push_back(tokens[streams_idx + 1 + i]);
-                std::string sid = tokens[streams_idx + 1 + num_streams + i];
-
-                if (sid == "$") {
-                    std::lock_guard<std::mutex> lock(db_mutex);
-                    std::string k = keys.back();
-                    if (stream_store.count(k) && !stream_store[k].empty()) {
-                        sid = stream_store[k].back().id;
-                    } else {
-                        sid = "0-0";
-                    }
-                }
-                start_ids.push_back(sid);
-            }
-
-            auto fetch_entries = [&](std::string& response, size_t& matched_streams) -> bool {
-                response = "";
-                matched_streams = 0;
-                for (size_t i = 0; i < num_streams; ++i) {
-                    std::string key = keys[i];
-                    std::string start_str = start_ids[i];
-
-                    uint64_t start_ms = 0, start_seq = 0;
-                    bool dummy;
-                    parse_stream_id(start_str, start_ms, start_seq, dummy);
-
-                    std::string stream_entries_resp = "";
-                    size_t entry_count = 0;
-
-                    if (stream_store.count(key)) {
-                        for (const auto& entry : stream_store[key]) {
-                            uint64_t entry_ms = 0, entry_seq = 0;
-                            parse_stream_id(entry.id, entry_ms, entry_seq, dummy);
-
-                            bool gt_start = (entry_ms > start_ms) || (entry_ms == start_ms && entry_seq > start_seq);
-
-                            if (gt_start) {
-                                entry_count++;
-                                stream_entries_resp += "*2\r\n";
-                                stream_entries_resp += "$" + std::to_string(entry.id.length()) + "\r\n" + entry.id + "\r\n";
-                                stream_entries_resp += "*" + std::to_string(entry.kv_pairs.size() * 2) + "\r\n";
-                                for (const auto& kv : entry.kv_pairs) {
-                                    stream_entries_resp += "$" + std::to_string(kv.first.length()) + "\r\n" + kv.first + "\r\n";
-                                    stream_entries_resp += "$" + std::to_string(kv.second.length()) + "\r\n" + kv.second + "\r\n";
-                                }
-                            }
-                        }
-                    }
-
-                    if (entry_count > 0) {
-                        matched_streams++;
-                        response += "*2\r\n";
-                        response += "$" + std::to_string(key.length()) + "\r\n" + key + "\r\n";
-                        response += "*" + std::to_string(entry_count) + "\r\n" + stream_entries_resp;
-                    }
-                }
-                return matched_streams > 0;
-            };
-
-            std::unique_lock<std::mutex> lock(db_mutex);
-            std::string response;
-            size_t matched_streams = 0;
-
-            bool has_data = fetch_entries(response, matched_streams);
-
-            if (!has_data && block_ms >= 0) {
-                if (block_ms == 0) {
-                    stream_cv.wait(lock, [&]() { return fetch_entries(response, matched_streams); });
-                } else {
-                    stream_cv.wait_for(lock, std::chrono::milliseconds(block_ms), [&]() {
-                        return fetch_entries(response, matched_streams);
-                    });
-                }
-            }
-
-            if (matched_streams > 0) {
-                return "*" + std::to_string(matched_streams) + "\r\n" + response;
-            } else {
-                return "$-1\r\n";
-            }
-        }
-    }
 
     return "-ERR unknown command\r\n";
 }
 
+std::string handleExec(ClientState& client) {
+    if (!client.in_multi) {
+        return "-ERR EXEC without MULTI\r\n";
+    }
+
+    if (client.transaction_dirty) {
+        client.queued_commands.clear();
+        client.in_multi = false;
+        client.transaction_dirty = false;
+        cleanupClientWatches(client);
+        return "*-1\r\n";
+    }
+
+    std::string response = "*" + std::to_string(client.queued_commands.size()) + "\r\n";
+    for (const auto& queued_tokens : client.queued_commands) {
+        response += execute_command(queued_tokens);
+    }
+
+    client.queued_commands.clear();
+    client.in_multi = false;
+    cleanupClientWatches(client);
+
+    return response;
+}
+
+std::string handleDiscard(ClientState& client) {
+    if (!client.in_multi) {
+        return "-ERR DISCARD without MULTI\r\n";
+    }
+
+    client.queued_commands.clear();
+    client.in_multi = false;
+    client.transaction_dirty = false;
+    cleanupClientWatches(client);
+
+    return "+OK\r\n";
+}
+
 void handle_client(int client_fd) {
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        clients_registry[client_fd] = ClientState{client_fd};
+    }
+
     char buffer[4096];
-    bool in_transaction = false;
-    std::vector<std::vector<std::string>> command_queue;
 
     while (true) {
         ssize_t bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
@@ -382,56 +409,119 @@ void handle_client(int client_fd) {
         std::string command = tokens[0];
         std::transform(command.begin(), command.end(), command.begin(), ::toupper);
 
-        if (command == "MULTI") {
-            if (in_transaction) {
-                std::string err = "-ERR MULTI calls can not be nested\r\n";
-                send(client_fd, err.c_str(), err.length(), 0);
+        db_mutex.lock();
+        ClientState& client = clients_registry[client_fd];
+        db_mutex.unlock();
+
+        std::string res;
+
+        if (command == "WATCH") {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            res = handleWatch(client, tokens);
+        }
+        else if (command == "UNWATCH") {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            res = handleUnwatch(client);
+        }
+        else if (command == "MULTI") {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            if (client.in_multi) {
+                res = "-ERR MULTI calls can not be nested\r\n";
             } else {
-                in_transaction = true;
-                command_queue.clear();
-                std::string res = "+OK\r\n";
-                send(client_fd, res.c_str(), res.length(), 0);
+                client.in_multi = true;
+                client.queued_commands.clear();
+                res = "+OK\r\n";
             }
         }
         else if (command == "EXEC") {
-            if (!in_transaction) {
-                std::string err = "-ERR EXEC without MULTI\r\n";
-                send(client_fd, err.c_str(), err.length(), 0);
-            } else {
-                in_transaction = false;
-                std::string res = "*" + std::to_string(command_queue.size()) + "\r\n";
-                for (const auto& queued_tokens : command_queue) {
-                    res += execute_command(queued_tokens);
-                }
-                command_queue.clear();
-                send(client_fd, res.c_str(), res.length(), 0);
-            }
+            res = handleExec(client);
         }
         else if (command == "DISCARD") {
-            if (!in_transaction) {
-                std::string err = "-ERR DISCARD without MULTI\r\n";
-                send(client_fd, err.c_str(), err.length(), 0);
-            } else {
-                in_transaction = false;
-                command_queue.clear();
-                std::string res = "+OK\r\n";
-                send(client_fd, res.c_str(), res.length(), 0);
-            }
+            std::lock_guard<std::mutex> lock(db_mutex);
+            res = handleDiscard(client);
         }
-        else if (in_transaction) {
-            command_queue.push_back(tokens);
-            std::string res = "+QUEUED\r\n";
-            send(client_fd, res.c_str(), res.length(), 0);
+        else if (client.in_multi) {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            client.queued_commands.push_back(tokens);
+            res = "+QUEUED\r\n";
         }
         else {
-            std::string res = execute_command(tokens);
+            res = execute_command(tokens);
+        }
+
+        if (!res.empty()) {
             send(client_fd, res.c_str(), res.length(), 0);
         }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        cleanupClientWatches(clients_registry[client_fd]);
+        clients_registry.erase(client_fd);
     }
     close(client_fd);
 }
 
-int main() {
+void initiate_handshake() {
+    int master_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (master_fd < 0) return;
+
+    sockaddr_in master_addr{};
+    master_addr.sin_family = AF_INET;
+    master_addr.sin_port = htons(master_port);
+    inet_pton(AF_INET, master_host.c_str(), &master_addr.sin_addr);
+
+    if (connect(master_fd, (struct sockaddr*)&master_addr, sizeof(master_addr)) < 0) {
+        std::cerr << "Failed to connect to master at " << master_host << ":" << master_port << std::endl;
+        close(master_fd);
+        return;
+    }
+
+    char buf[512];
+
+    // 1. Send PING
+    std::string ping_cmd = "*1\r\n$4\r\nPING\r\n";
+    send(master_fd, ping_cmd.c_str(), ping_cmd.length(), 0);
+    recv(master_fd, buf, sizeof(buf), 0);
+
+    // 2. Send REPLCONF listening-port
+    std::string port_str = std::to_string(server_port);
+    std::string replconf1 = "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$" + 
+                            std::to_string(port_str.length()) + "\r\n" + port_str + "\r\n";
+    send(master_fd, replconf1.c_str(), replconf1.length(), 0);
+    recv(master_fd, buf, sizeof(buf), 0);
+
+    // 3. Send REPLCONF capa psync2
+    std::string replconf2 = "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n";
+    send(master_fd, replconf2.c_str(), replconf2.length(), 0);
+    recv(master_fd, buf, sizeof(buf), 0);
+
+    // 4. Send PSYNC ? -1
+    std::string psync = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
+    send(master_fd, psync.c_str(), psync.length(), 0);
+    recv(master_fd, buf, sizeof(buf), 0);
+
+    std::thread(handle_client, master_fd).detach();
+}
+
+int main(int argc, char* argv[]) {
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--port" && i + 1 < argc) {
+            server_port = std::stoi(argv[++i]);
+        } else if (arg == "--replicaof" && i + 1 < argc) {
+            server_role = "replica";
+            std::string replica_arg = argv[++i];
+
+            std::stringstream ss(replica_arg);
+            if (ss >> master_host) {
+                if (!(ss >> master_port) && i + 1 < argc) {
+                    master_port = std::stoi(argv[++i]);
+                }
+            }
+        }
+    }
+
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) return 1;
 
@@ -441,12 +531,16 @@ int main() {
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(6379);
+    server_addr.sin_port = htons(server_port);
 
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) return 1;
     if (listen(server_fd, 5) < 0) return 1;
 
-    std::cout << "Redis TCP Server listening on port 6379..." << std::endl;
+    std::cout << "Redis TCP Server (" << server_role << ") listening on port " << server_port << "..." << std::endl;
+
+    if (server_role == "replica") {
+        std::thread(initiate_handshake).detach();
+    }
 
     while (true) {
         sockaddr_in client_addr{};
