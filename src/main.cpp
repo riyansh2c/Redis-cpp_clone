@@ -4,6 +4,8 @@
 #include <sstream>
 #include <thread>
 #include <mutex>
+#include <unordered_map>
+#include <chrono>
 #include <algorithm>
 #include <cstring>
 #include <unistd.h>
@@ -11,7 +13,18 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-// Global state configuration
+// Storage structures for Key-Value store with TTL support
+struct ValueWithExpiry {
+    std::string value;
+    std::chrono::time_point<std::chrono::system_clock> expiry_time;
+    bool has_expiry = false;
+};
+
+// Global Data Structures
+std::unordered_map<std::string, ValueWithExpiry> g_store;
+std::mutex g_store_mutex;
+
+// Global State Configuration
 struct ServerConfig {
     int port = 6379;
     std::string role = "master";
@@ -23,6 +36,10 @@ struct ServerConfig {
 
 ServerConfig g_config;
 std::mutex g_config_mutex;
+
+// Track active connected replica sockets
+std::vector<int> g_replicas;
+std::mutex g_replicas_mutex;
 
 // Raw 88-byte hex string representing a valid empty RDB file
 const std::string EMPTY_RDB_HEX = "524544495330303131fe00ff52a2e19d6b240179";
@@ -42,6 +59,14 @@ std::string hex_to_bytes(const std::string& hex) {
 std::string to_upper(std::string str) {
     std::transform(str.begin(), str.end(), str.begin(), ::toupper);
     return str;
+}
+
+// Helper to propagate raw command bytes to all registered replicas
+void propagate_to_replicas(const std::string& raw_cmd) {
+    std::lock_guard<std::mutex> lock(g_replicas_mutex);
+    for (int replica_fd : g_replicas) {
+        send(replica_fd, raw_cmd.c_str(), raw_cmd.length(), 0);
+    }
 }
 
 // Parse RESP Array strings into vector tokens
@@ -69,7 +94,7 @@ std::vector<std::string> parse_resp_array(const std::string& buffer) {
 }
 
 // Execute commands and return RESP response strings
-std::string execute_command(const std::vector<std::string>& tokens, int client_fd) {
+std::string execute_command(const std::vector<std::string>& tokens, int client_fd, const std::string& raw_buffer) {
     if (tokens.empty()) return "";
 
     std::string cmd = to_upper(tokens[0]);
@@ -80,9 +105,51 @@ std::string execute_command(const std::vector<std::string>& tokens, int client_f
     else if (cmd == "ECHO" && tokens.size() > 1) {
         return "$" + std::to_string(tokens[1].length()) + "\r\n" + tokens[1] + "\r\n";
     }
-    else if (cmd == "INFO") {
-        std::string section = (tokens.size() > 1) ? to_upper(tokens[1]) : "";
+    else if (cmd == "SET" && tokens.size() >= 3) {
+        std::string key = tokens[1];
+        std::string val = tokens[2];
         
+        ValueWithExpiry entry;
+        entry.value = val;
+
+        if (tokens.size() >= 5 && to_upper(tokens[3]) == "PX") {
+            int px_ms = std::stoi(tokens[4]);
+            entry.has_expiry = true;
+            entry.expiry_time = std::chrono::system_clock::now() + std::chrono::milliseconds(px_ms);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_store_mutex);
+            g_store[key] = entry;
+        }
+
+        // Propagate SET command to replicas if we are acting as Master
+        {
+            std::lock_guard<std::mutex> lock(g_config_mutex);
+            if (g_config.role == "master") {
+                propagate_to_replicas(raw_buffer);
+            }
+        }
+
+        return "+OK\r\n";
+    }
+    else if (cmd == "GET" && tokens.size() >= 2) {
+        std::string key = tokens[1];
+        std::lock_guard<std::mutex> lock(g_store_mutex);
+
+        auto it = g_store.find(key);
+        if (it == g_store.end()) {
+            return "$-1\r\n";
+        }
+
+        if (it->second.has_expiry && std::chrono::system_clock::now() >= it->second.expiry_time) {
+            g_store.erase(it);
+            return "$-1\r\n";
+        }
+
+        return "$" + std::to_string(it->second.value.length()) + "\r\n" + it->second.value + "\r\n";
+    }
+    else if (cmd == "INFO") {
         std::lock_guard<std::mutex> lock(g_config_mutex);
         std::string info_body = "# Replication\r\n";
         info_body += "role:" + g_config.role + "\r\n";
@@ -102,18 +169,23 @@ std::string execute_command(const std::vector<std::string>& tokens, int client_f
             replid = g_config.master_replid;
         }
 
-        // 1. Return +FULLRESYNC header
+        // 1. Send +FULLRESYNC header
         std::string resync_msg = "+FULLRESYNC " + replid + " 0\r\n";
         send(client_fd, resync_msg.c_str(), resync_msg.length(), 0);
 
-        // 2. Decode and transmit empty RDB snapshot payload
+        // 2. Send empty RDB binary payload
         std::string rdb_bytes = hex_to_bytes(EMPTY_RDB_HEX);
         std::string rdb_header = "$" + std::to_string(rdb_bytes.length()) + "\r\n";
 
         send(client_fd, rdb_header.c_str(), rdb_header.length(), 0);
         send(client_fd, rdb_bytes.data(), rdb_bytes.length(), 0);
 
-        // Already responded over socket, return empty string to avoid duplicate send
+        // 3. Save replica file descriptor to propagate write commands later
+        {
+            std::lock_guard<std::mutex> lock(g_replicas_mutex);
+            g_replicas.push_back(client_fd);
+        }
+
         return "";
     }
 
@@ -123,10 +195,7 @@ std::string execute_command(const std::vector<std::string>& tokens, int client_f
 // Background thread for replica handshake initialization
 void initiate_handshake(const std::string& master_host, int master_port, int replica_port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        std::cerr << "Failed to create socket for replication handshake\n";
-        return;
-    }
+    if (sock < 0) return;
 
     struct sockaddr_in master_addr{};
     master_addr.sin_family = AF_INET;
@@ -134,7 +203,6 @@ void initiate_handshake(const std::string& master_host, int master_port, int rep
     inet_pton(AF_INET, master_host.c_str(), &master_addr.sin_addr);
 
     if (connect(sock, (struct sockaddr*)&master_addr, sizeof(master_addr)) < 0) {
-        std::cerr << "Failed to connect to master for handshake\n";
         close(sock);
         return;
     }
@@ -174,8 +242,9 @@ void handle_client(int client_fd) {
         ssize_t bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
         if (bytes_received <= 0) break;
 
-        std::vector<std::string> tokens = parse_resp_array(std::string(buffer, bytes_received));
-        std::string response = execute_command(tokens, client_fd);
+        std::string raw_buffer(buffer, bytes_received);
+        std::vector<std::string> tokens = parse_resp_array(raw_buffer);
+        std::string response = execute_command(tokens, client_fd, raw_buffer);
 
         if (!response.empty()) {
             send(client_fd, response.c_str(), response.length(), 0);
@@ -185,7 +254,6 @@ void handle_client(int client_fd) {
 }
 
 int main(int argc, char* argv[]) {
-    // Parse CLI arguments (--port, --replicaof)
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--port" && i + 1 < argc) {
@@ -208,18 +276,15 @@ int main(int argc, char* argv[]) {
     server_addr.sin_port = htons(g_config.port);
 
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) != 0) {
-        std::cerr << "Failed to bind to port " << g_config.port << "\n";
         return 1;
     }
 
     if (listen(server_fd, 5) != 0) {
-        std::cerr << "Failed to listen on socket\n";
         return 1;
     }
 
     std::cout << "Redis TCP Server (" << g_config.role << ") listening on port " << g_config.port << "...\n";
 
-    // Launch handshake background thread if configured as replica
     if (g_config.role == "replica") {
         std::thread(initiate_handshake, g_config.master_host, g_config.master_port, g_config.port).detach();
     }
